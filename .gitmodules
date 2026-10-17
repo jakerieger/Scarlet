@@ -1,0 +1,3 @@
+[submodule "Vendor/BinderKeys"]
+	path = Vendor/BinderKeys
+	url = https://github.com/JKAnderson/BinderKeys.git
