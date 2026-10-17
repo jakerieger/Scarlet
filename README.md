@@ -21,17 +21,21 @@ archives, or from loose files if you've unpacked the game or are working on a mo
 - Skeleton hierarchy with each bone's local transform at the playhead, and the selected bone highlighted in the
   viewport.
 - Orbit camera: left or right drag to orbit, middle drag to pan, wheel to zoom, F to frame the character.
+- Editing: pose a bone at a frame to key an offset (rotation and translation) layered over the animation;
+  keys interpolate between frames, show on the timeline, and can be undone and redone. Click a joint in the
+  viewport to select its bone.
+- Saving: edited animations are written into their animation binders in a mod folder (the `chr` folder of a
+  Mod Engine 2 mod), keeping any other changes already saved there.
 
-Keyboard: Space plays/pauses, Left/Right step a frame, F frames the character.
+Keyboard: Space plays/pauses, Left/Right step a frame, F frames the character, Ctrl+S saves edits, Ctrl+Z/Ctrl+Y
+undo and redo.
 
 ## Roadmap
 
 - The player character's body, assembled from equipment parts.
 - Named, decoded fields for Elden Ring's event types (for now they're shown as raw values).
 - Normal maps and the rest of each material.
-- Editing: keyframe and curve editing of bone tracks, and root motion.
-- Saving: writing edited animations back into an animation binder, for use in a mod (libSouls already writes
-  spline-compressed animations).
+- Editing tools: a rotate/move gizmo in the viewport, curve editing, and root motion editing.
 
 ## Building
 

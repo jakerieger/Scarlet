@@ -52,6 +52,7 @@ namespace Scarlet {
     std::vector<QsTransform> Player::LocalPose(const Souls::Havok::Skeleton& Skeleton) const {
         std::vector<QsTransform> Pose = Skeleton.ReferencePose;
         if (_Current) _Current->Binding.Apply(_Current->Animation, Time, Pose);
+        if (_Current && Edits) Edits->Apply(Frame(), Pose);
         return Pose;
     }
 

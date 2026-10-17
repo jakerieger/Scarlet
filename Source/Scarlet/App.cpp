@@ -7,6 +7,8 @@
 // Public License along with this program. If not, see https://www.gnu.org/licenses/.
 
 #include "App.hpp"
+
+#include "Save.hpp"
 #include "Resource.h"
 #include "Version.h"
 
@@ -38,14 +40,16 @@ namespace Scarlet {
                    }) != Text.end();
         }
 
-        std::optional<fs::path> PickFolder(HWND Owner) {
+        std::optional<fs::path> PickFolder(HWND Owner,
+                                           const wchar_t* Title = L"Choose the Elden Ring game folder (the one with "
+                                                                  L"eldenring.exe)") {
             Microsoft::WRL::ComPtr<IFileOpenDialog> Dialog;
             if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&Dialog))))
                 return std::nullopt;
             DWORD Options = 0;
             Dialog->GetOptions(&Options);
             Dialog->SetOptions(Options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-            Dialog->SetTitle(L"Choose the Elden Ring game folder (the one with eldenring.exe)");
+            Dialog->SetTitle(Title);
             if (FAILED(Dialog->Show(Owner))) return std::nullopt;
             Microsoft::WRL::ComPtr<IShellItem> Item;
             if (FAILED(Dialog->GetResult(&Item))) return std::nullopt;
@@ -192,6 +196,12 @@ namespace Scarlet {
             case WM_SYSCOMMAND:
                 if ((WParam & 0xFFF0) == SC_KEYMENU) return 0;  // Alt doesn't open a window menu
                 break;
+            case WM_CLOSE:
+                if (Self && !Self->_ForceClose && Self->HasUnsavedEdits()) {
+                    Self->_Pending = Pending::Close;
+                    return 0;
+                }
+                break;
             case WM_DESTROY:
                 PostQuitMessage(0);
                 return 0;
@@ -237,10 +247,13 @@ namespace Scarlet {
         std::ifstream In(_SettingsFolder / "settings.ini");
         std::string Line;
         while (std::getline(In, Line)) {
-            constexpr std::string_view Key = "GameFolder=";
+            constexpr std::string_view Key = "GameFolder=", Mod = "ModFolder=";
             if (Line.rfind(Key, 0) == 0) {
                 const std::string Value = Line.substr(Key.size());
                 if (!Value.empty()) OpenGameFolder(fs::path(std::u8string(Value.begin(), Value.end())));
+            } else if (Line.rfind(Mod, 0) == 0) {
+                const std::string Value = Line.substr(Mod.size());
+                _ModFolder              = fs::path(std::u8string(Value.begin(), Value.end()));
             }
         }
     }
@@ -248,6 +261,7 @@ namespace Scarlet {
     void App::SaveSettings() const {
         std::ofstream Out(_SettingsFolder / "settings.ini");
         Out << "GameFolder=" << (_Game ? ToUtf8(_Game->Root()) : std::string()) << "\n";
+        Out << "ModFolder=" << ToUtf8(_ModFolder) << "\n";
     }
 
     void App::ApplyLookAndFeel() {
@@ -367,7 +381,12 @@ namespace Scarlet {
         _SelectedBone = -1;
         _ClipBinder = _ClipIndex = -1;
         _Playback.SetClip(nullptr);
+        _Playback.Edits = nullptr;
         _Queue.clear();
+        _Edits.clear();
+        _Undo.clear();
+        _Redo.clear();
+        _CurrentClipKey.clear();
         if (!_Game || Index < 0 || Index >= static_cast<int>(_Game->Characters().size())) return;
         for (const std::string& Path : _Game->Characters()[Index].Binders)
             _Binders.push_back({Path, nullptr, false});
@@ -404,6 +423,16 @@ namespace Scarlet {
         });
     }
 
+    void App::RequestCharacter(int Index) {
+        if (Index == _SelectedCharacter) return;
+        if (HasUnsavedEdits()) {
+            _Pending          = Pending::SwitchCharacter;
+            _PendingCharacter = Index;
+            return;
+        }
+        SelectCharacter(Index);
+    }
+
     void App::RequestBinder(size_t Index) {
         if (Index >= _Binders.size() || _Binders[Index].Requested) return;
         _Binders[Index].Requested              = true;
@@ -424,14 +453,17 @@ namespace Scarlet {
         std::shared_ptr<const LoadedBinder> Main   = _Binders[0].Loaded;  // its compendium, for binders without one
         const AnimationEntry Entry                 = Binder->Animations.at(AnimationIndex);
         const uint64_t For                         = _Generation;
+        const std::string Key                      = ClipKey(BinderIndex, Entry.Name);
         _ClipBinder                                = static_cast<int>(BinderIndex);
         _ClipIndex                                 = static_cast<int>(AnimationIndex);
-        Enqueue("Decoding " + Entry.Name, [this, Binder, Main, Entry, For]() -> std::function<void()> {
+        Enqueue("Decoding " + Entry.Name, [this, Binder, Main, Entry, For, Key]() -> std::function<void()> {
             std::shared_ptr<const Clip> Loaded = Clip::Load(*Binder, Entry, Main.get());
-            return [this, Loaded, For] {
+            return [this, Loaded, For, Key] {
                 if (For != _Generation) return;
                 const bool WasPlaying = _Playback.Playing;
                 _SelectedEvent        = -1;
+                _CurrentClipKey       = Key;
+                if (const auto Found = _Edits.find(Key); Found != _Edits.end()) Found->second.Source = Loaded;
                 _Playback.SetClip(Loaded);
                 _Playback.Playing = WasPlaying || !_Playback.CurrentClip();
             };
@@ -473,6 +505,8 @@ namespace Scarlet {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
+        const ClipEdits* Playing = CurrentEdits();
+        _Playback.Edits          = Playing ? &Playing->Layer : nullptr;
         _Playback.Update(ImGui::GetIO().DeltaTime);
         HandleShortcuts();
         DrawMenu();
@@ -486,6 +520,7 @@ namespace Scarlet {
         DrawTimeline();
         DrawViewport();
 
+        DrawUnsavedPrompt();
         if (!_ErrorMessage.empty()) ImGui::OpenPopup("Error");
         if (ImGui::BeginPopupModal("Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::PushTextWrapPos(ImGui::GetFontSize() * 36.f);
@@ -510,8 +545,16 @@ namespace Scarlet {
             if (ImGui::MenuItem("Open Game Folder...")) {
                 if (const auto Folder = PickFolder(_Window)) OpenGameFolder(*Folder);
             }
+            if (ImGui::MenuItem("Set Mod Folder...")) PickModFolder();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Save Edits", "Ctrl+S", false, HasUnsavedEdits())) SaveEdits();
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) PostMessageW(_Window, WM_CLOSE, 0, 0);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Edit")) {
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !_Undo.empty())) Undo();
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !_Redo.empty())) Redo();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
@@ -523,9 +566,10 @@ namespace Scarlet {
             if (ImGui::MenuItem("Reset Layout")) _BuildLayout = true;
             ImGui::EndMenu();
         }
-        // What's loading, on the right of the menu bar.
-        if (!_RunningDescription.empty()) {
-            const std::string Text = _RunningDescription + "...";
+        // What's loading (or just happened), on the right of the menu bar.
+        const bool Recent = !_Status.empty() && ImGui::GetTime() - _StatusTime < 6.0;
+        if (!_RunningDescription.empty() || Recent) {
+            const std::string Text = _RunningDescription.empty() ? _Status : _RunningDescription + "...";
             ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(Text.c_str()).x - ImGui::GetFontSize());
             ImGui::TextDisabled("%s", Text.c_str());
         }
@@ -562,6 +606,11 @@ namespace Scarlet {
     void App::HandleShortcuts() {
         const ImGuiIO& IO = ImGui::GetIO();
         if (IO.WantTextInput || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) return;
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S) && HasUnsavedEdits()) SaveEdits();
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z)) Undo();
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) ||
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z))
+            Redo();
         if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) _Playback.Playing = !_Playback.Playing;
         if (ImGui::IsKeyPressed(ImGuiKey_F, false)) FrameCharacter();
         if (_Playback.CurrentClip()) {
@@ -599,7 +648,7 @@ namespace Scarlet {
                         const CharacterFiles& C = Characters[I];
                         if (!Contains(C.Id, _CharacterFilter)) continue;
                         const std::string Label = C.Id + "  (" + std::to_string(C.Binders.size()) + ")";
-                        if (ImGui::Selectable(Label.c_str(), I == _SelectedCharacter)) SelectCharacter(I);
+                        if (ImGui::Selectable(Label.c_str(), I == _SelectedCharacter)) RequestCharacter(I);
                     }
                 }
                 ImGui::EndChild();
@@ -633,8 +682,13 @@ namespace Scarlet {
                                 if (!Contains(Animations[A].Name, _AnimationFilter)) continue;
                                 const bool Selected =
                                   _ClipBinder == static_cast<int>(B) && _ClipIndex == static_cast<int>(A);
+                                // Edited clips are marked: * until saved.
+                                std::string Label = Animations[A].Name;
+                                if (const auto Found = _Edits.find(ClipKey(B, Animations[A].Name));
+                                    Found != _Edits.end() && (Found->second.Dirty || !Found->second.Layer.Empty()))
+                                    Label += Found->second.Dirty ? "  *" : "  (edited)";
                                 ImGui::PushID(static_cast<int>(A));
-                                if (ImGui::Selectable(Animations[A].Name.c_str(), Selected)) PlayClip(B, A);
+                                if (ImGui::Selectable(Label.c_str(), Selected)) PlayClip(B, A);
                                 ImGui::PopID();
                             }
                         }
@@ -653,7 +707,8 @@ namespace Scarlet {
                 ImGui::TextDisabled("No skeleton loaded.");
             } else {
                 ImGui::Text("%s: %zu bones", _Skeleton->Name.c_str(), _Skeleton->BoneNames.size());
-                const float DetailsHeight = _SelectedBone >= 0 ? ImGui::GetTextLineHeightWithSpacing() * 5.f : 0.f;
+                const float Lines         = _SelectedBone < 0 ? 0.f : _Playback.CurrentClip() ? 14.f : 5.f;
+                const float DetailsHeight = ImGui::GetTextLineHeightWithSpacing() * Lines;
                 if (ImGui::BeginChild("tree", ImVec2(0.f, -DetailsHeight), ImGuiChildFlags_Borders)) {
                     // Children of each bone, so the tree can be drawn from the roots down.
                     std::vector<std::vector<int>> Children(_Skeleton->BoneNames.size());
@@ -694,6 +749,7 @@ namespace Scarlet {
                                 T.Rotation.Z,
                                 T.Rotation.W);
                     ImGui::Text("Scale        %.4f  %.4f  %.4f", T.Scale.X, T.Scale.Y, T.Scale.Z);
+                    DrawBoneEditor();
                 }
             }
         }
@@ -812,6 +868,7 @@ namespace Scarlet {
                 _Playback.SeekFrame(Frame);
             }
             ImGui::EndDisabled();
+            if (Current) DrawKeyStrip(*Current);
             if (Current && Current->Events) DrawEventTrack(*Current);
         }
         ImGui::End();
@@ -1043,6 +1100,27 @@ namespace Scarlet {
                     _Camera.Pan(IO.MouseDelta.x, IO.MouseDelta.y, float(Height));
             }
 
+            // A click (not a drag) on a joint selects its bone.
+            if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+                ImGui::GetIO().MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < 16.f && _ShowSkeleton) {
+                const ImVec2 Corner = ImGui::GetItemRectMin(), Mouse = ImGui::GetIO().MousePos;
+                float Best = 12.f * 12.f;
+                for (size_t I = 0; I < Pose.size(); ++I) {
+                    const auto& P = Pose[I].Translation;
+                    const DirectX::XMVECTOR Clip_ =
+                      DirectX::XMVector4Transform(DirectX::XMVectorSet(P.X, P.Y, P.Z, 1.f), ViewProjection);
+                    const float W = DirectX::XMVectorGetW(Clip_);
+                    if (W <= 0.f) continue;
+                    const float X  = Corner.x + (DirectX::XMVectorGetX(Clip_) / W * 0.5f + 0.5f) * float(Width);
+                    const float Y  = Corner.y + (0.5f - DirectX::XMVectorGetY(Clip_) / W * 0.5f) * float(Height);
+                    const float D2 = (X - Mouse.x) * (X - Mouse.x) + (Y - Mouse.y) * (Y - Mouse.y);
+                    if (D2 < Best) {
+                        Best          = D2;
+                        _SelectedBone = static_cast<int>(I);
+                    }
+                }
+            }
+
             // What's shown, top left.
             ImGui::SetCursorPos(ImVec2(ImGui::GetFontSize() * 0.6f, ImGui::GetFontSize() * 0.4f));
             if (_SelectedCharacter >= 0) {
@@ -1055,6 +1133,306 @@ namespace Scarlet {
         }
         ImGui::End();
         ImGui::PopStyleVar();
+    }
+#pragma endregion
+
+#pragma region Editing
+    std::string App::ClipKey(size_t Binder, const std::string& Name) const {
+        const std::string& Path = _Binders.at(Binder).GamePath;
+        return Path.substr(Path.find_last_of('/') + 1) + "/" + Name;
+    }
+
+    App::ClipEdits* App::CurrentEdits() {
+        const auto Found = _Edits.find(_CurrentClipKey);
+        return Found == _Edits.end() ? nullptr : &Found->second;
+    }
+
+    App::ClipEdits& App::EnsureEdits() {
+        ClipEdits& Edits = _Edits[_CurrentClipKey];
+        Edits.Binder     = static_cast<size_t>(std::max(_ClipBinder, 0));
+        if (!Edits.Source) Edits.Source = _Playback.CurrentClip();
+        return Edits;
+    }
+
+    int App::TrackOfBone(int Bone) const {
+        const auto& Current = _Playback.CurrentClip();
+        if (!Current) return -1;
+        const auto& Map  = Current->Binding.TrackToBone;
+        const auto Found = std::find(Map.begin(), Map.end(), static_cast<int16_t>(Bone));
+        return Found == Map.end() ? -1 : static_cast<int>(Found - Map.begin());
+    }
+
+    bool App::HasUnsavedEdits() const {
+        return std::any_of(_Edits.begin(), _Edits.end(), [](const auto& Entry) { return Entry.second.Dirty; });
+    }
+
+    void App::PushUndo() {
+        _Undo.push_back({_CurrentClipKey, EnsureEdits().Layer});
+        _Redo.clear();
+        if (_Undo.size() > 256) _Undo.erase(_Undo.begin());
+    }
+
+    void App::Undo() {
+        if (_Undo.empty()) return;
+        UndoStep Step = std::move(_Undo.back());
+        _Undo.pop_back();
+        ClipEdits& Edits = _Edits[Step.ClipKey];
+        _Redo.push_back({Step.ClipKey, Edits.Layer});
+        Edits.Layer = std::move(Step.Before);
+        Edits.Dirty = true;
+    }
+
+    void App::Redo() {
+        if (_Redo.empty()) return;
+        UndoStep Step = std::move(_Redo.back());
+        _Redo.pop_back();
+        ClipEdits& Edits = _Edits[Step.ClipKey];
+        _Undo.push_back({Step.ClipKey, Edits.Layer});
+        Edits.Layer = std::move(Step.Before);
+        Edits.Dirty = true;
+    }
+
+    bool App::PickModFolder() {
+        const auto Folder = PickFolder(_Window, L"Choose the mod folder edited animations are saved into");
+        if (!Folder) return false;
+        _ModFolder = *Folder;
+        SaveSettings();
+        return true;
+    }
+
+    void App::SetStatus(std::string Message) {
+        _Status     = std::move(Message);
+        _StatusTime = ImGui::GetTime();
+    }
+
+    void App::SaveEdits(std::function<void()> Then) {
+        if (_ModFolder.empty() && !PickModFolder()) return;
+
+        // Every binder with unsaved edits, and its edited clips (with their edits as they stand now).
+        struct ClipToSave {
+            std::string Key;
+            std::shared_ptr<const Clip> Source;
+            EditLayer Layer;
+        };
+        struct BinderToSave {
+            std::shared_ptr<const LoadedBinder> Binder;
+            std::string FileName;
+            std::vector<ClipToSave> Clips;
+        };
+        std::map<size_t, BinderToSave> Binders;
+        for (const auto& [Key, Edits] : _Edits) {
+            if (!Edits.Dirty || !Edits.Source || Edits.Binder >= _Binders.size()) continue;
+            BinderToSave& Save = Binders[Edits.Binder];
+            Save.Binder        = _Binders[Edits.Binder].Loaded;
+            Save.FileName      = Key.substr(0, Key.find('/'));
+            Save.Clips.push_back({Key, Edits.Source, Edits.Layer});
+        }
+        if (Binders.empty()) return;
+
+        const fs::path Folder = _ModFolder / "chr";
+        Enqueue("Saving edits", [this, Binders, Folder, Then]() -> std::function<void()> {
+            std::vector<std::pair<std::string, EditLayer>> Saved;
+            for (const auto& [Index, Save] : Binders) {
+                std::vector<BinderReplacement> Replacements;
+                for (const ClipToSave& Clip : Save.Clips) {
+                    const std::string FileName = Clip.Source->Name + ".hkx";
+                    if (Clip.Layer.Empty()) {
+                        // No edits left: the clip as the game has it.
+                        const auto Entry =
+                          std::find_if(Save.Binder->Animations.begin(),
+                                       Save.Binder->Animations.end(),
+                                       [&](const AnimationEntry& E) { return E.Name == Clip.Source->Name; });
+                        if (Entry == Save.Binder->Animations.end()) continue;
+                        Replacements.push_back({FileName, Save.Binder->Binder.Files[Entry->File].Bytes});
+                    } else {
+                        Replacements.push_back({FileName, EncodeEditedClip(*Clip.Source, Clip.Layer)});
+                    }
+                    Saved.emplace_back(Clip.Key, Clip.Layer);
+                }
+                SaveBinder(*Save.Binder, Replacements, Folder / Save.FileName);
+            }
+            const size_t Count = Binders.size();
+            return [this, Saved, Count, Folder, Then] {
+                // Clips edited again while saving stay unsaved.
+                for (const auto& [Key, Layer] : Saved) {
+                    if (const auto Found = _Edits.find(Key); Found != _Edits.end() && Found->second.Layer == Layer)
+                        Found->second.Dirty = false;
+                }
+                SetStatus("Saved " + std::to_string(Count) + (Count == 1 ? " binder" : " binders") + " to " +
+                          ToUtf8(Folder));
+                if (Then) Then();
+            };
+        });
+    }
+
+    void App::DrawBoneEditor() {
+        const auto& Current = _Playback.CurrentClip();
+        if (!Current || _SelectedBone < 0) return;
+        const int Bone = _SelectedBone;
+        ImGui::SeparatorText("Edit");
+        if (TrackOfBone(Bone) < 0) {
+            ImGui::TextWrapped("This clip doesn't animate %s, so it can't be keyed.",
+                               _Skeleton->BoneNames[Bone].c_str());
+            return;
+        }
+
+        ClipEdits* Edits   = CurrentEdits();
+        const float Frame  = std::round(_Playback.Frame());
+        BoneKey Offset     = Edits ? Edits->Layer.OffsetAt(Bone, Frame) : BoneKey {};
+        Offset.Frame       = Frame;
+        const bool Keyed   = Edits && Edits->Layer.KeyAt(Bone, Frame);
+        const bool HasKeys = Edits && Edits->Layer.Keys.count(Bone) != 0;
+        ImGui::Text("Frame %d%s", static_cast<int>(Frame), Keyed ? "  (key)" : "");
+
+        // Dragging a value keys the bone at this frame; a whole drag is one undo step.
+        bool Changed = false, Started = false;
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 4.f);
+        Changed |= ImGui::DragFloat3("Rotate", &Offset.RotationDegrees.X, 0.2f, -360.f, 360.f, "%.1f deg");
+        Started |= ImGui::IsItemActivated();
+        ImGui::SetNextItemWidth(-ImGui::GetFontSize() * 4.f);
+        Changed |= ImGui::DragFloat3("Move", &Offset.Translation.X, 0.001f, -10.f, 10.f, "%.3f");
+        Started |= ImGui::IsItemActivated();
+        if (Started) PushUndo();
+        if (Changed) {
+            _Playback.Playing = false;
+            _Playback.SeekFrame(Frame);
+            ClipEdits& Target = EnsureEdits();
+            Target.Layer.SetKey(Bone, Offset);
+            Target.Dirty = true;
+        }
+
+        if (ImGui::Button("Key")) {
+            PushUndo();
+            ClipEdits& Target = EnsureEdits();
+            Target.Layer.SetKey(Bone, Offset);
+            Target.Dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!Keyed);
+        if (ImGui::Button("Delete Key")) {
+            PushUndo();
+            ClipEdits& Target = EnsureEdits();
+            Target.Layer.RemoveKey(Bone, Frame);
+            Target.Dirty = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!HasKeys);
+        if (ImGui::Button("Clear Bone")) {
+            PushUndo();
+            ClipEdits& Target = EnsureEdits();
+            Target.Layer.ClearBone(Bone);
+            Target.Dirty = true;
+        }
+        ImGui::EndDisabled();
+
+        // The bone's keys; clicking one goes to it.
+        if (HasKeys) {
+            ImGui::TextDisabled("Keys:");
+            for (const BoneKey& Key : CurrentEdits()->Layer.Keys.at(Bone)) {
+                ImGui::SameLine();
+                ImGui::PushID(static_cast<int>(Key.Frame * 4.f));
+                if (ImGui::SmallButton(std::to_string(static_cast<int>(Key.Frame)).c_str())) {
+                    _Playback.Playing = false;
+                    _Playback.SeekFrame(Key.Frame);
+                }
+                ImGui::PopID();
+            }
+        }
+    }
+
+    void App::DrawKeyStrip(const Clip& Current) {
+        const ClipEdits* Edits = CurrentEdits();
+        if (!Edits || Edits->Layer.Empty()) return;
+        const float Duration = std::max(Current.Animation.Duration, 1e-3f);
+        const float FrameDur = Current.Animation.FrameDuration;
+
+        ImDrawList* Draw    = ImGui::GetWindowDrawList();
+        const ImVec2 Origin = ImGui::GetCursorScreenPos();
+        const float RowH    = ImGui::GetTextLineHeight() + 6.f;
+        const float LabelW  = ImGui::GetFontSize() * 10.f;
+        const float Width   = std::max(ImGui::GetContentRegionAvail().x, LabelW + 10.f);
+        const float TrackX  = Origin.x + LabelW;
+        const float TrackW  = Width - LabelW;
+        const float Middle  = Origin.y + RowH * 0.5f;
+        const ImVec2 Mouse  = ImGui::GetIO().MousePos;
+
+        const std::string Label =
+          _SelectedBone >= 0 ? "Keys  " + _Skeleton->BoneNames[_SelectedBone] : std::string("Keys");
+        Draw->AddText(ImVec2(Origin.x + 4.f, Origin.y + 3.f), ImGui::GetColorU32(ImGuiCol_TextDisabled), Label.c_str());
+        Draw->AddLine(ImVec2(TrackX, Middle), ImVec2(TrackX + TrackW, Middle), IM_COL32(255, 255, 255, 24));
+
+        // A diamond per key: the selected bone's bright, other edited bones' faint.
+        int HitBone   = -1;
+        float HitTime = 0.f;
+        for (const auto& [Bone, List] : Edits->Layer.Keys) {
+            const bool Mine = Bone == _SelectedBone;
+            for (const BoneKey& Key : List) {
+                const float Time = Key.Frame * FrameDur;
+                const float X    = TrackX + std::clamp(Time / Duration, 0.f, 1.f) * TrackW;
+                const float S    = Mine ? 6.f : 4.f;
+                Draw->AddQuadFilled(ImVec2(X, Middle - S),
+                                    ImVec2(X + S, Middle),
+                                    ImVec2(X, Middle + S),
+                                    ImVec2(X - S, Middle),
+                                    Mine ? IM_COL32(255, 210, 60, 255) : IM_COL32(255, 140, 50, 110));
+                if (std::abs(Mouse.x - X) <= 6.f && std::abs(Mouse.y - Middle) <= RowH * 0.5f &&
+                    (HitBone < 0 || Mine)) {
+                    HitBone = Bone;
+                    HitTime = Time;
+                }
+            }
+        }
+        const float Head = TrackX + std::clamp(_Playback.Time / Duration, 0.f, 1.f) * TrackW;
+        Draw->AddLine(ImVec2(Head, Origin.y), ImVec2(Head, Origin.y + RowH), IM_COL32(255, 210, 60, 255), 2.f);
+
+        ImGui::SetCursorScreenPos(ImVec2(TrackX, Origin.y));
+        ImGui::InvisibleButton("keys", ImVec2(TrackW, RowH));
+        if (HitBone >= 0 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s, frame %d",
+                              _Skeleton->BoneNames[HitBone].c_str(),
+                              int(std::round(HitTime / FrameDur)));
+        if (ImGui::IsItemClicked() && HitBone >= 0) {
+            _SelectedBone     = HitBone;
+            _Playback.Playing = false;
+            _Playback.Time    = HitTime;
+        }
+    }
+
+    void App::DrawUnsavedPrompt() {
+        if (_Pending != Pending::None && !ImGui::IsPopupOpen("Unsaved Edits")) ImGui::OpenPopup("Unsaved Edits");
+        if (!ImGui::BeginPopupModal("Unsaved Edits", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+        ImGui::TextUnformatted("Some animations have edits that aren't saved.");
+        // What to do once the edits are saved or discarded.
+        auto Continue = [this] {
+            const Pending What = _Pending;
+            _Pending           = Pending::None;
+            if (What == Pending::Close) {
+                _ForceClose = true;
+                PostMessageW(_Window, WM_CLOSE, 0, 0);
+            } else if (What == Pending::SwitchCharacter) {
+                SelectCharacter(_PendingCharacter);
+            }
+        };
+        const ImVec2 Button(ImGui::GetFontSize() * 6.f, 0.f);
+        if (ImGui::Button("Save", Button)) {
+            ImGui::CloseCurrentPopup();
+            SaveEdits(Continue);
+            if (!HasUnsavedEdits() || _ModFolder.empty()) _Pending = Pending::None;  // nothing to wait for
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Discard", Button)) {
+            ImGui::CloseCurrentPopup();
+            for (auto& [Key, Edits] : _Edits)
+                Edits.Dirty = false;
+            Continue();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", Button)) {
+            ImGui::CloseCurrentPopup();
+            _Pending = Pending::None;
+        }
+        ImGui::EndPopup();
     }
 #pragma endregion
 
@@ -1077,14 +1455,18 @@ namespace Scarlet {
 
     std::vector<LineVertex> App::SkeletonLines(const std::vector<QsTransform>& Pose) const {
         std::vector<LineVertex> Lines;
+        const EditLayer* Edits = _Playback.Edits;
         for (size_t I = 0; I < Pose.size(); ++I) {
             const int Parent    = _Skeleton->Parents[I];
             const bool Selected = static_cast<int>(I) == _SelectedBone;
+            const bool Edited   = Edits && Edits->Keys.count(static_cast<int>(I)) != 0;
             if (Parent >= 0)
                 AddLine(Lines,
                         Pose[Parent].Translation,
                         Pose[I].Translation,
-                        Selected ? Rgba(255, 210, 60) : Rgba(120, 200, 255));
+                        Selected ? Rgba(255, 210, 60)
+                        : Edited ? Rgba(255, 140, 50)
+                                 : Rgba(120, 200, 255));
             // A small cross at each joint.
             constexpr float Size   = 0.01f;
             const Souls::Vector3 P = Pose[I].Translation;

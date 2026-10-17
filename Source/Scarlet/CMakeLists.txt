@@ -6,6 +6,8 @@ add_executable(Scarlet WIN32
         App.hpp
         Camera.cpp
         Camera.hpp
+        Edit.cpp
+        Edit.hpp
         GameData.cpp
         GameData.hpp
         Main.cpp
@@ -15,6 +17,8 @@ add_executable(Scarlet WIN32
         Player.hpp
         Renderer.cpp
         Renderer.hpp
+        Save.cpp
+        Save.hpp
 )
 
 target_link_libraries(Scarlet PRIVATE Souls imgui d3d11 d3dcompiler dxgi shell32 ole32)

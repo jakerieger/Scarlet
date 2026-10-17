@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "Edit.hpp"
 #include "GameData.hpp"
 
 #include <memory>
@@ -17,11 +18,12 @@ namespace Scarlet {
     /// @brief Plays a clip on a skeleton: the playhead, and the pose it gives.
     class Player {
     public:
-        float Time      = 0.f;   ///< The playhead, in seconds.
-        float Speed     = 1.f;   ///< Playback rate.
-        bool Playing    = true;  ///< Whether the playhead advances.
-        bool Loop       = true;  ///< Whether playback wraps at the end (or stops).
-        bool RootMotion = true;  ///< Whether to move the character by the clip's root motion.
+        float Time             = 0.f;      ///< The playhead, in seconds.
+        float Speed            = 1.f;      ///< Playback rate.
+        bool Playing           = true;     ///< Whether the playhead advances.
+        bool Loop              = true;     ///< Whether playback wraps at the end (or stops).
+        bool RootMotion        = true;     ///< Whether to move the character by the clip's root motion.
+        const EditLayer* Edits = nullptr;  ///< The clip's edits, layered over it (or none).
 
         /// @brief Starts playing a clip from the beginning (nullptr to show the reference pose).
         void SetClip(std::shared_ptr<const Clip> NewClip);
@@ -36,7 +38,7 @@ namespace Scarlet {
         /// @brief The clip's duration, or 0 without a clip.
         float Duration() const;
 
-        /// @brief The skeleton's local pose at the playhead: the reference pose with the clip applied.
+        /// @brief The skeleton's local pose at the playhead: the reference pose with the clip and its edits applied.
         std::vector<Souls::Havok::QsTransform> LocalPose(const Souls::Havok::Skeleton& Skeleton) const;
         /// @brief The pose in model space, moved by root motion if that's on.
         std::vector<Souls::Havok::QsTransform> ModelPose(const Souls::Havok::Skeleton& Skeleton) const;

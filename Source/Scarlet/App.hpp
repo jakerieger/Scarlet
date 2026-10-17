@@ -9,6 +9,7 @@
 #pragma once
 
 #include "Camera.hpp"
+#include "Edit.hpp"
 #include "GameData.hpp"
 #include "Model.hpp"
 #include "Player.hpp"
@@ -16,6 +17,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <future>
 #include <memory>
 #include <optional>
@@ -73,6 +75,30 @@ namespace Scarlet {
         std::string _RunningDescription;
         std::string _ErrorMessage;  ///< shown in a popup
 
+        // Edits to the selected character's clips, by "<binder file>/<clip>", with undo and redo.
+        struct ClipEdits {
+            size_t Binder = 0;                   ///< which of the character's binders the clip is in
+            std::shared_ptr<const Clip> Source;  ///< the clip as decoded, which the edits are layered over
+            EditLayer Layer;
+            bool Dirty = false;  ///< changed since the last save
+        };
+        struct UndoStep {
+            std::string ClipKey;
+            EditLayer Before;
+        };
+        std::map<std::string, ClipEdits> _Edits;
+        std::string _CurrentClipKey;  ///< the playing clip's
+        std::vector<UndoStep> _Undo, _Redo;
+        std::filesystem::path _ModFolder;  ///< where edited binders are saved (a Mod Engine 2 mod folder)
+
+        // Leaving with unsaved edits asks first.
+        enum class Pending { None, Close, SwitchCharacter };
+        Pending _Pending      = Pending::None;
+        int _PendingCharacter = -1;
+        bool _ForceClose      = false;
+        std::string _Status;  ///< a message shown in the menu bar for a few seconds
+        double _StatusTime = 0.0;
+
         char _CharacterFilter[64] = {};
         char _AnimationFilter[64] = {};
 
@@ -85,6 +111,7 @@ namespace Scarlet {
 
         void OpenGameFolder(const std::filesystem::path& Folder);
         void SelectCharacter(int Index);
+        void RequestCharacter(int Index);  ///< SelectCharacter, asking first if there are unsaved edits
         void RequestBinder(size_t Index);
         void PlayClip(size_t Binder, size_t Animation);
         void Enqueue(std::string Description, std::function<std::function<void()>()> Work);
@@ -103,6 +130,21 @@ namespace Scarlet {
         void DrawEvents();
         void DrawEventTrack(const Clip& Current);
         void HandleShortcuts();
+
+        std::string ClipKey(size_t Binder, const std::string& Clip) const;
+        ClipEdits* CurrentEdits();
+        ClipEdits& EnsureEdits();  ///< the playing clip's edits, created if there are none yet
+        int TrackOfBone(int Bone) const;
+        bool HasUnsavedEdits() const;
+        void PushUndo();
+        void Undo();
+        void Redo();
+        bool PickModFolder();
+        void SaveEdits(std::function<void()> Then = {});
+        void SetStatus(std::string Message);
+        void DrawBoneEditor();
+        void DrawKeyStrip(const Clip& Current);
+        void DrawUnsavedPrompt();
         static std::vector<LineVertex> GridLines();
         std::vector<LineVertex> SkeletonLines(const std::vector<Souls::Havok::QsTransform>& Pose) const;
         void FrameCharacter();
